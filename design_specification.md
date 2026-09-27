@@ -25,7 +25,7 @@
 |---|---|---|
 | JWTのセッション管理方式 | アクセストークン（メモリ保持）＋リフレッシュトークン（httpOnlyクッキー） | ユーザー確定 |
 | BFF（リバースプロキシ）構成 | Next.jsのRoute HandlersをBFFとして使用（Frontend内で完結、追加インフラなし） | Claude提案（要件定義書に記載なし・追加インフラ不要な構成を優先） |
-| バーコードのデコード処理 | クライアント側（ブラウザ内JS）でカメラ映像から検出。ハードウェアスキャナー方式は不採用 | Claude提案（理由：要件2.1「カメラ映像エリアの常時表示」がハードウェアスキャナー方式と矛盾するため） |
+| バーコードのデコード処理 | クライアント側（ブラウザ内JS、`@zxing/browser`を使用）でカメラ映像から検出。ハードウェアスキャナー方式は不採用。将来レジ端末をChrome系ブラウザに固定できる場合は、ブラウザ標準`BarcodeDetector` APIへの置き換えを軽量化オプションとして検討する（2段構え） | Claude提案・ユーザー確定（理由：要件2.1「カメラ映像エリアの常時表示」がハードウェアスキャナー方式と矛盾するため。ライブラリは端末のブラウザ環境が未確定なためクロスブラウザ対応を優先） |
 
 この3点の理由・詳細は §1、§4.2、§8 に記載する。
 
@@ -51,7 +51,7 @@ graph TB
     end
     subgraph AzureCloud["Microsoft Azure"]
         D[("Azure Database for MySQL<br/>Flexible Server")]
-        E["メール送信サービス<br/>（MFAワンタイムコード送付）<br/>⚠️要確認：本番実装 or 開発用モック"]
+        E["メール送信サービス<br/>（MFAワンタイムコード送付）<br/>開発フェーズはモック化（DB記録のみ、実送信なし）"]
     end
 
     A -- "HTTPS（同一オリジン）" --> B
@@ -286,7 +286,7 @@ erDiagram
         string member_id PK
         string name
         string gender
-        int age
+        int age_at_registration
         datetime created_at
         datetime updated_at
     }
@@ -361,18 +361,99 @@ erDiagram
 | password_hash | VARCHAR(255) | bcrypt等でハッシュ化。平文は保持しない |
 | email | VARCHAR(255) | MFA送付先 |
 | name | VARCHAR(100) | |
-| failed_login_count | INT | DEFAULT 0。パスワード誤りとOTP誤りを合算してカウント ⚠️要確認 |
+| failed_login_count | INT | DEFAULT 0。**パスワード認証の誤りのみ**をカウント（MFAコード誤りは含まない。要件定義書3.1に明記済み） |
 | locked_until | DATETIME | NULL可。10回失敗到達時に現在時刻+30分をセット |
 
-**member（会員）**：要件3.1「電話番号・住所は取得しない」を反映し、氏名・性別・年齢のみを保持。年齢は要件定義書の記載通り年齢そのものを保持する設計とした（誕生日から都度算出する方式ではない）⚠️要確認：経年で値が古くなる点を許容するか確認が必要。
+**member（会員）**：要件3.1「電話番号・住所は取得しない」を反映し、氏名・性別・年齢のみを保持。年齢の取得目的はマーケティング上のおおよその年代把握であり、生年月日（日単位まで特定できる、より機微度の高い情報）までは不要と判断し、以下の方式を採用する。
 
-**product（商品マスタ）**：本アプリの読み取り専用対象。作成・更新・削除APIは要件1.1「店舗管理者機能はスコープ外」により**設計しない**。マスタの初期投入・更新は本アプリ外（DB直接操作等）で行う前提。`code`は個包装商品のバーコード、または対面パンの商品コード一覧表（早見表）に印字されたバーコードのいずれかで、システム上は同一の`code`として扱う。⚠️要確認：バーコード規格をJANコード（8/13桁）と仮定。
+- `age_at_registration`：会員登録（会員ID発行）時点で確認できた年齢をそのまま保持する。
+- 画面・APIレスポンス上の「年齢」は、`age_at_registration + 経過年数`（`created_at`からの経過年数。365.25日を1年とみなし切り捨て）として**都度計算**する。DBには計算後の値を保存しない。
 
-**discount（値引きマスタ）**：`discount_type`は`'rate'`（定率、`discount_value`を%として解釈）または`'amount'`（定額、`discount_value`を円として解釈）。対象商品は`discount_product`で多対多。⚠️要確認：同一商品・同一期間に複数の有効な値引きが重複設定された場合の優先順位（本書では「マスタ運用上重複させない」ことを前提とし、万一重複時は割引額が最大のものを適用するフェイルセーフのみ実装する想定）。
+この方式により、生年月日という新たな個人情報区分を追加で取得することなく、登録時からの経年による実年齢とのズレを解消する。
+
+**product（商品マスタ）**：本アプリの読み取り専用対象。作成・更新・削除APIは要件1.1「店舗管理者機能はスコープ外」により**設計しない**。マスタの初期投入・更新は本アプリ外（DB直接操作等）で行う前提。`code`は個包装商品のバーコード、または対面パンの商品コード一覧表（早見表）に印字されたバーコードのいずれかで、システム上は同一の`code`として扱う。バーコード規格はJANコード（8/13桁）を前提とする（実店舗データがないため、この前提を維持。実装時のバリデーションは可変長対応とする）。
+
+**discount（値引きマスタ）**：`discount_type`は`'rate'`（定率、`discount_value`を%として解釈）または`'amount'`（定額、`discount_value`を円として解釈）。対象商品は`discount_product`で多対多。同一商品・同一期間に複数の有効な値引きが該当する場合は、**値引き額が大きい方を適用する**（要件定義書2.4に明記済み）。
 
 **transaction / transaction_item（取引・取引明細）**：要件2.5「確定済み取引の単価は商品マスタの単価変更で改変されない」に対応するため、`transaction_item.unit_price_at_transaction`に確定時点の単価をスナップショットする（`product`テーブルの`unit_price`を直接参照しない）。要件3.2「取引は担当者・日時・商品・数量・金額・値引き有無を後から追跡できる」は本テーブル構成（`staff_id`・`transaction_datetime`・明細）で充足する。
 
 **mfa_code / refresh_token**：OTP・リフレッシュトークンともに平文はDBに保存せずハッシュ化して保存する（漏えい時の悪用を防ぐ）。
+
+### 5.2 クラス図（ドメインモデル）
+
+```mermaid
+classDiagram
+    class Staff {
+        +int staff_id
+        +str login_id
+        +str password_hash
+        +str email
+        +str name
+        +int failed_login_count
+        +datetime locked_until
+        +verify_password(password) bool
+        +is_locked() bool
+    }
+    class Member {
+        +str member_id
+        +str name
+        +str gender
+        +int age_at_registration
+        +datetime created_at
+        +get_current_age() int
+    }
+    class Product {
+        +int product_id
+        +str code
+        +str name
+        +int unit_price
+    }
+    class Discount {
+        +int discount_id
+        +str discount_type
+        +Decimal discount_value
+        +bool member_only
+        +datetime start_datetime
+        +datetime end_datetime
+        +is_effective(at, member) bool
+        +apply(unit_price, quantity) int
+    }
+    class Transaction {
+        +int transaction_id
+        +int staff_id
+        +str member_id
+        +str idempotency_key
+        +int subtotal_excl_tax
+        +int tax_amount
+        +int total_incl_tax
+        +int discount_total
+        +datetime transaction_datetime
+    }
+    class TransactionItem {
+        +int transaction_item_id
+        +int product_id
+        +int quantity
+        +int unit_price_at_transaction
+        +int line_discount_amount
+        +int line_subtotal
+    }
+    class CartCalculationService {
+        +calculate(member_id, items) CartResult
+    }
+    class TransactionService {
+        +confirm(idempotency_key, member_id, items, client_total) Transaction
+    }
+
+    Transaction "1" *-- "many" TransactionItem
+    TransactionItem --> Product
+    Transaction --> Staff
+    Transaction --> Member
+    CartCalculationService ..> Product
+    CartCalculationService ..> Discount
+    TransactionService ..> CartCalculationService
+```
+
+`CartCalculationService`・`TransactionService`はバックエンド側のドメインサービス（§4.3の再計算・照合ロジックを担う）であり、DBテーブルとは対応しない。
 
 ---
 
@@ -427,6 +508,8 @@ erDiagram
 ```json
 { "member_id": "string", "name": "string", "gender": "string", "age": 0 }
 ```
+`age`はDBの`age_at_registration`から都度計算した現在時点の推定年齢であり、ストアド値ではない（§5.1参照）。
+
 エラー：`404 member_not_found`（要件2.4「該当する会員が存在しない場合はエラー表示・再入力」に対応）
 
 #### 6. GET /api/products/{code}
@@ -487,10 +570,17 @@ erDiagram
 | 操作パネル | 選択行の数量変更（1〜99）・削除 |
 | 購入確定ボタン／合計ポップアップ | 税込・税抜合計をポップアップ表示し、確定操作を行う |
 
-### 7.2 フロントエンド状態管理 ⚠️要確認（React標準のuseState/useReducer等、状態管理ライブラリの指定なし）
+### 7.2 フロントエンド状態管理
 
-- カート状態（購入リスト・選択行・会員情報）はページ内のローカル状態として保持し、DBへは購入確定時のみ書き込む。
-- 認証状態（アクセストークン）はメモリ（Reactの状態）に保持し、ページリロード時は`/api/auth/refresh`をhttpOnlyクッキーで再実行してアクセストークンを再取得する。
+外部の状態管理ライブラリ（Redux／Zustand／Jotai等）は導入せず、React標準機能（`useReducer`／Context API）のみで構成する。§7.1のとおり単一画面（レジ操作画面）で完結するアプリであり、複数画面をまたぐ複雑な共有状態やキャッシュ管理の要件がないため、標準機能で十分かつシンプルに保てると判断した。
+
+| 状態の種類 | 実現方法 | 理由 |
+|---|---|---|
+| 購入リスト・選択行・会員情報（レジ操作セッションの状態） | `useReducer`（レジ画面のトップレベルClient Componentで保持） | 「スキャンで行追加」「数量変更」「削除」「会員ID設定」「確定後リセット」など状態遷移がアクション単位で明確なため、`useState`の乱立よりも一箇所でTypeScriptの型付きアクションとして管理する方が見通しが良い。DBへは購入確定時のみ書き込む |
+| 認証状態（アクセストークン） | React Context（`AuthContext`）＋`useState` | 複数コンポーネント（API呼び出し箇所すべて）から参照する必要があるため、Context経由で提供する。ルートレイアウトでProviderをラップする。ページリロード時は`/api/auth/refresh`をhttpOnlyクッキーで再実行し、アクセストークンを再取得する |
+| サーバーからの取得データ（商品照会・会員照会・カート計算・取引確定の結果） | イベントハンドラ（スキャン検知・確定ボタン押下等）から都度`fetch`を呼び、結果を上記reducerの状態に反映 | 画面をまたいだキャッシュ共有や自動再取得（React Query/SWR等が解決する課題）が発生しない単一画面アプリのため、宣言的データフェッチライブラリを導入するメリットが薄い |
+
+レジ操作画面はカメラ映像・リアルタイムの状態更新を伴うため、Next.js App Router上でClient Component（`"use client"`）として実装する。
 
 ---
 
@@ -498,8 +588,8 @@ erDiagram
 
 ### 8.1 認証・認可（JWT）
 
-- アクセストークン：JWT、有効期限 **15分** ⚠️要確認。ブラウザのメモリ（React状態）にのみ保持し、localStorage/sessionStorageには保存しない（XSS時の窃取リスク低減）。
-- リフレッシュトークン：有効期限 **12時間**（開店〜閉店の1シフトを想定）⚠️要確認。`HttpOnly; Secure; SameSite=Strict`属性のクッキーとして発行し、DBには**ハッシュ化して**保存（漏えい時に再利用不可）。ログアウト・不審な利用時に個別失効可能とする。
+- アクセストークン：JWT、有効期限 **15分**。ブラウザのメモリ（React状態）にのみ保持し、localStorage/sessionStorageには保存しない（XSS時の窃取リスク低減）。
+- リフレッシュトークン：有効期限 **12時間**（開店〜閉店の1シフトを想定）。`HttpOnly; Secure; SameSite=Strict`属性のクッキーとして発行し、DBには**ハッシュ化して**保存（漏えい時に再利用不可）。ログアウト・不審な利用時に個別失効可能とする。
 - 認可：APIは全て（`/auth/*`を除き）Authorizationヘッダのアクセストークンを検証。担当者IDをリクエストコンテキストに紐づけ、取引記録に反映する。
 
 ### 8.2 BFF・CORS
@@ -523,7 +613,7 @@ FastAPIの`/docs`・`/redoc`・`/openapi.json`は本番環境では無効化す�
 
 ### 8.6 依存パッケージのバージョン管理
 
-- Next.js・FastAPI・主要ライブラリ（SQLAlchemy、Pydantic、認証ライブラリ等）は既知の脆弱性が修正されたバージョンを使用し、`npm audit` / `pip-audit`等で定期的に脆弱性の有無を確認する運用とする ⚠️要確認（CI組み込みの要否）。
+- Next.js・FastAPI・主要ライブラリ（SQLAlchemy、Pydantic、認証ライブラリ等）は既知の脆弱性が修正されたバージョンを使用する。CIパイプライン（GitHub Actions等）に`npm audit` / `pip-audit`の実行を組み込み、push/PR時に自動チェックする運用とする。
 
 ### 8.7 パスワード・ログイン試行制限
 
@@ -543,14 +633,14 @@ FastAPIの`/docs`・`/redoc`・`/openapi.json`は本番環境では無効化す�
 
 | 項目 | 範囲・制約 | 根拠 |
 |---|---|---|
-| パスワード | 15文字以上 ⚠️上限は128文字と仮定 | 要件確定＋Claude仮定 |
-| ログイン試行 | 10回失敗で30分ロック | 要件確定 |
-| OTPコード | 6桁数字、有効期限5分 ⚠️要確認 | Claude仮定 |
+| パスワード | 15文字以上、128文字以下 | 要件確定＋ユーザー確定 |
+| ログイン試行 | パスワード認証10回失敗で30分ロック（MFA誤りは含まない） | 要件確定 |
+| OTPコード | 6桁数字、有効期限5分 | ユーザー確定 |
 | 購入リストの数量 | 1〜99個 | 要件確定 |
-| 会員の年齢 | 0〜120 ⚠️要確認 | Claude仮定 |
+| 会員の年齢（登録時） | 0〜120（`age_at_registration`の入力値。表示用の年齢は都度計算） | ユーザー確定 |
 | 値引き（定率） | 0〜100% | Claude仮定 |
 | 値引き（定額） | 0円以上、対象商品単価以下 | Claude仮定（単価を超える値引きは業務上不整合のため） |
-| 商品コード/バーコード | JANコード（8桁または13桁）を想定 ⚠️要確認 | Claude仮定 |
+| 商品コード/バーコード | JANコード（8桁または13桁）を想定 | ユーザー確定（実店舗データがないため前提を維持） |
 
 ### 9.2 エラーハンドリング方針
 
@@ -567,7 +657,7 @@ FastAPIの`/docs`・`/redoc`・`/openapi.json`は本番環境では無効化す�
 
 ### 10.1 応答速度の一定化・コールドスタート回避
 
-- 要件3.2「リクエストごとのコールドスタート構成を避ける」に対応するため、FastAPI・Next.jsとも常時起動するホスティング構成（例：Azure App ServiceのAlways On設定）とし、サーバーレス関数（都度起動型）は採用しない ⚠️要確認：具体的なAzureサービス選定（App Service / Container Apps等）。
+- 要件3.2「リクエストごとのコールドスタート構成を避ける」に対応するため、FastAPI・Next.jsとも**Azure App Service（Linux、B1プラン以上）**上でそれぞれ個別のWebアプリとしてホスティングし、「Always On」設定を有効化する。サーバーレス関数（都度起動型）・スケールtoゼロ構成のサービス（Container Apps等）は、今回の規模（レジ1〜2台）ではオーバースペックかつ運用負荷が増すため採用しない。
 - DB接続はSQLAlchemyのコネクションプールを使用し、リクエストごとの接続確立コストを避ける。
 
 ### 10.2 取引の整合性（二重確定・未確定防止）
@@ -578,24 +668,25 @@ FastAPIの`/docs`・`/redoc`・`/openapi.json`は本番環境では無効化す�
 
 ### 10.3 バックアップ運用
 
-- Azure Database for MySQL Flexible Serverの自動バックアップ機能を使用し、実行スケジュールを営業時間外（深夜等）に設定する ⚠️要確認：具体的な時間帯・保持期間。
+- Azure Database for MySQL Flexible Serverの自動バックアップ機能を使用し、**毎日0:00〜6:00の時間帯**に実行、**保持期間12ヶ月**とする。
 
 ---
 
-## 11. 要確認事項一覧（総括）
+## 11. 要件確認プロセスの記録（確定事項一覧）
 
-本書で仮決めした項目を以下にまとめる。レビュー後、確定した内容を本書および要件定義書側に反映すること。
+初回ドラフト作成時にClaudeが仮決めした13項目について、レビューを経てすべて確定した。要件定義書（requirements.md）側への反映が必要だった項目には★を付す。
 
-1. **MFAメール送信の実装レベル**：本番相当のメール送信サービス（例：Azure Communication Services）を実装するか、開発フェーズでは送信をモック化（DB記録・コンソール出力のみ）するか。
-2. **failed_login_countの集計対象**：パスワード誤りのみをカウントするか、OTP誤りも合算するか。
-3. **会員の年齢データ**：登録時点の年齢をそのまま保持する設計としたが、経年劣化（実年齢とのズレ）を許容するか。
-4. **値引きの重複適用ルール**：同一商品・同一期間に複数の有効な値引きが設定された場合の優先順位。
-5. **バーコード規格**：JANコード（8/13桁）を前提としたが、実際に使用する印刷物・商品のバーコード規格の確認。
-6. **各種有効期限の具体値**：アクセストークン15分、リフレッシュトークン12時間、OTP有効期限5分とした仮の数値。
-7. **パスワードの上限文字数**：128文字と仮定。
-8. **会員年齢の範囲**：0〜120と仮定。
-9. **消費税の端数処理ルール**：小数点以下の扱い（切り捨て/四捨五入/切り上げ）が要件定義書に未記載。本書では税込・税抜合計とも円未満切り捨てを仮の前提としているが、明記が必要。
-10. **依存パッケージの脆弱性チェックの運用方法**：CI組み込みか手動確認か。
-11. **ホスティング先のAzureサービス選定**：App Service / Container Apps等、Always On運用が可能な具体的なサービスの選定。
-12. **DBバックアップの実行時間帯・保持期間**：具体的な設定値。
-13. **バーコードデコードに使用する具体的なJSライブラリ**：ブラウザ標準の`BarcodeDetector` API を第一候補とし、非対応ブラウザ向けにポリフィル/JSライブラリ（例：ZXing系）を併用する想定だが、実際に使用する端末・ブラウザ環境の確認が必要。
+1. **MFAメール送信の実装レベル**：開発フェーズはモック化（DB記録のみ、実際のメール送信は行わない）。
+2. ★**failed_login_countの集計対象**：パスワード誤りのみをカウント（MFAコード誤りは含まない）。requirements.md 3.1に反映済み。
+3. **会員の年齢データ**：`age_at_registration`（登録時に確認した年齢）を保持し、表示・利用時は登録日（`created_at`）からの経過年数を加算して都度計算する（§5.1参照）。生年月日（日単位の情報）は新たに取得しない。データ最小化とマーケティング用途の「おおよその年代把握」を両立する方式として採用。
+4. ★**値引きの重複適用ルール**：同一商品に複数の有効な値引きが該当する場合は、値引き額が大きい方を適用する。requirements.md 2.4に反映済み。
+5. **バーコード規格**：JANコード（8桁または13桁）の前提を維持。実店舗データがないため、コード桁数のバリデーションは可変長対応で緩めに実装する。
+6. **各種トークン・コードの有効期限**：アクセストークン15分、リフレッシュトークン12時間、OTP5分を採用。
+7. **パスワードの上限文字数**：128文字を採用。
+8. **会員年齢（登録時）の入力範囲**：0〜120を採用（`age_at_registration`のバリデーション）。
+9. ★**消費税の端数処理ルール**：税込・税抜合計とも1円未満切り捨て。requirements.md 2.7に反映済み。
+10. **依存パッケージの脆弱性チェック**：CI（GitHub Actions等）に`npm audit` / `pip-audit`を組み込み、push/PR時に自動実行する。
+11. **ホスティング先のAzureサービス**：Azure App Service（Linux、B1プラン以上）を採用。Next.js・FastAPIそれぞれ個別のWebアプリとして構成し、Always On設定を有効化する。
+12. **DBバックアップ**：毎日0:00〜6:00に実行、保持期間12ヶ月。
+13. **バーコードデコードライブラリ**：`@zxing/browser`を採用（クロスブラウザ対応を優先）。将来レジ端末のブラウザ環境をChrome系に固定できる場合は、ブラウザ標準`BarcodeDetector` APIへの置き換えを軽量化オプションとして検討する（2段構え）。
+14. **フロントエンド状態管理**：外部ライブラリは導入せず、React標準の`useReducer`（購入リスト等のセッション状態）＋Context API（認証状態）のみで構成する。単一画面アプリのため複数画面をまたぐ共有状態管理が不要と判断（§7.2参照）。
